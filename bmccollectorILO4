@@ -1,0 +1,418 @@
+#requires -Version 5.1
+<#
+BMC Collector v5 - HPE iLO 4 Compatible
+- Redfish + REST fallback
+- Prometheus exporter /metrics
+#>
+
+param(
+  [string]$TargetsPath = "C:\BMCCollector\targets.json",
+  [int]$PollSeconds = 30,
+  [int]$ListenPort = 9105,
+  [int]$TimeoutSec = 8,
+  [string]$BmcUser = "bmc_monitor",
+  [string]$BmcPass = "PASS123!"
+)
+
+$ErrorActionPreference = "Stop"
+
+$BaseDir = "C:\BMCCollector"
+$MetricsPath = Join-Path $BaseDir "metrics.txt"
+
+if (!(Test-Path $BaseDir)) {
+  New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
+}
+
+if ([string]::IsNullOrWhiteSpace($BmcUser)) {
+  $BmcUser = [Environment]::GetEnvironmentVariable("REDFISH_USER", "Machine")
+}
+
+if ([string]::IsNullOrWhiteSpace($BmcPass)) {
+  $BmcPass = [Environment]::GetEnvironmentVariable("REDFISH_PASS", "Machine")
+}
+
+$pollScript = {
+  param($TargetsPath, $PollSeconds, $TimeoutSec, $MetricsPath, $User, $Pass)
+
+  $ErrorActionPreference = "Continue"
+
+  function Esc([string]$s) {
+    if ($null -eq $s) { return "" }
+    return ($s -replace '\\', '\\' -replace '"', '\"')
+  }
+
+  function PromLine([string]$name, [hashtable]$labels, [string]$value) {
+    $lbl = ($labels.GetEnumerator() | Sort-Object Name | ForEach-Object {
+      "$($_.Name)=`"$(Esc $_.Value)`""
+    }) -join ","
+
+    if ($lbl) { return "$name{$lbl} $value" }
+    return "$name $value"
+  }
+
+  function HealthCode([string]$h) {
+    switch ($h) {
+      "OK"       { return 1 }
+      "Warning"  { return 2 }
+      "Critical" { return 3 }
+      default    { return 0 }
+    }
+  }
+
+  function Invoke-IloJson {
+    param(
+      [string]$Ip,
+      [string[]]$Paths,
+      [string]$User,
+      [string]$Pass,
+      [int]$TimeoutSecLocal
+    )
+
+    foreach ($Path in $Paths) {
+      $cleanPath = if ($Path.StartsWith("/")) { $Path } else { "/$Path" }
+      $url = "https://$Ip$cleanPath"
+
+      $args = @(
+        "-k",
+        "-sS",
+        "-L",
+        "--max-time", "$TimeoutSecLocal",
+        "-H", "Accept: application/json",
+        "-u", "${User}:${Pass}",
+        $url
+      )
+
+      $raw = & curl.exe @args 2>$null
+
+      if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($raw)) {
+        try {
+          return $raw | ConvertFrom-Json
+        } catch {}
+      }
+    }
+
+    throw "Nessun endpoint valido: $($Paths -join ', ')"
+  }
+
+  function Get-FirstOdataId {
+    param($Obj, [string]$Fallback)
+
+    if ($Obj -and $Obj.Members -and $Obj.Members.Count -gt 0 -and $Obj.Members[0].'@odata.id') {
+      return $Obj.Members[0].'@odata.id'
+    }
+
+    return $Fallback
+  }
+
+  while ($true) {
+    $pollStart = Get-Date
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    $lines.Add("# HELP bmc_up 1 se il BMC risponde a Redfish/REST, 0 altrimenti")
+    $lines.Add("# TYPE bmc_up gauge")
+    $lines.Add("# HELP bmc_health_status 0=Unknown 1=OK 2=Warning 3=Critical")
+    $lines.Add("# TYPE bmc_health_status gauge")
+    $lines.Add("# HELP bmc_system_info Info sistema value=1")
+    $lines.Add("# TYPE bmc_system_info gauge")
+    $lines.Add("# HELP bmc_manager_info Info BMC/Manager value=1")
+    $lines.Add("# TYPE bmc_manager_info gauge")
+    $lines.Add("# HELP bmc_drive_health_ok 1=OK, 0=Warning/Critical/Altro")
+    $lines.Add("# TYPE bmc_drive_health_ok gauge")
+    $lines.Add("# HELP bmc_drive_info Info disco value=1")
+    $lines.Add("# TYPE bmc_drive_info gauge")
+    $lines.Add("# HELP bmc_fan_health_ok 1=OK, 0 altrimenti")
+    $lines.Add("# TYPE bmc_fan_health_ok gauge")
+    $lines.Add("# HELP bmc_fan_rpm Velocita ventola RPM o percentuale")
+    $lines.Add("# TYPE bmc_fan_rpm gauge")
+    $lines.Add("# HELP bmc_temp_celsius Temperatura Celsius")
+    $lines.Add("# TYPE bmc_temp_celsius gauge")
+    $lines.Add("# HELP bmc_temp_health_ok 1=OK, 0 altrimenti")
+    $lines.Add("# TYPE bmc_temp_health_ok gauge")
+    $lines.Add("# HELP bmc_psu_health_ok 1=OK, 0 altrimenti")
+    $lines.Add("# TYPE bmc_psu_health_ok gauge")
+    $lines.Add("# HELP bmc_scrape_success 1=successo scrape target, 0=errore")
+    $lines.Add("# TYPE bmc_scrape_success gauge")
+    $lines.Add("# HELP bmc_target_scrape_duration_seconds Durata scrape per target")
+    $lines.Add("# TYPE bmc_target_scrape_duration_seconds gauge")
+    $lines.Add("# HELP bmc_scrape_duration_seconds Durata totale polling loop")
+    $lines.Add("# TYPE bmc_scrape_duration_seconds gauge")
+    $lines.Add("# HELP bmc_last_poll_timestamp Epoch seconds ultimo poll completato")
+    $lines.Add("# TYPE bmc_last_poll_timestamp gauge")
+    $lines.Add("# HELP bmc_scrape_error Info ultimo errore scrape value=1")
+    $lines.Add("# TYPE bmc_scrape_error gauge")
+
+    if ([string]::IsNullOrWhiteSpace($User) -or [string]::IsNullOrWhiteSpace($Pass)) {
+      $lines.Add("# ERROR: credenziali BMC mancanti")
+      $body = ($lines -join "`n") + "`n"
+      [IO.File]::WriteAllText($MetricsPath, $body, [Text.UTF8Encoding]::new($false))
+      Start-Sleep -Seconds $PollSeconds
+      continue
+    }
+
+    try {
+      $targets = Get-Content $TargetsPath -Raw | ConvertFrom-Json
+    } catch {
+      $lines.Add("# ERROR: impossibile leggere targets.json")
+      $targets = @()
+    }
+
+    foreach ($t in $targets) {
+      $tStart = Get-Date
+
+      $base = @{
+        instance = [string]$t.name
+        bmc_ip   = [string]$t.ip
+        vendor   = [string]$t.vendor
+        site     = [string]$t.site
+        customer = [string]$t.customer
+      }
+
+      $success = 1
+
+      try {
+        $sysRoot = $null
+
+        try {
+          $sysRoot = Invoke-IloJson -Ip $t.ip -Paths @(
+            "/redfish/v1/Systems/",
+            "/rest/v1/Systems/"
+          ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+        } catch {}
+
+        $sysId = Get-FirstOdataId -Obj $sysRoot -Fallback "/redfish/v1/Systems/1/"
+
+        $sys = Invoke-IloJson -Ip $t.ip -Paths @(
+          $sysId,
+          "/redfish/v1/Systems/1/",
+          "/redfish/v1/Systems/1",
+          "/rest/v1/Systems/1/",
+          "/rest/v1/Systems/1"
+        ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+        $lines.Add((PromLine "bmc_up" $base "1"))
+        $lines.Add((PromLine "bmc_health_status" $base ([string](HealthCode $sys.Status.Health))))
+
+        $sLbl = $base.Clone()
+        if ($sys.Manufacturer) { $sLbl.manufacturer = [string]$sys.Manufacturer }
+        if ($sys.Model)        { $sLbl.model        = [string]$sys.Model }
+        if ($sys.SerialNumber) { $sLbl.serial       = [string]$sys.SerialNumber }
+        if ($sys.BiosVersion)  { $sLbl.bios         = [string]$sys.BiosVersion }
+        $lines.Add((PromLine "bmc_system_info" $sLbl "1"))
+
+        try {
+          $mgr = Invoke-IloJson -Ip $t.ip -Paths @(
+            "/redfish/v1/Managers/1/",
+            "/redfish/v1/Managers/1",
+            "/rest/v1/Managers/1/",
+            "/rest/v1/Managers/1"
+          ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+          $mLbl = $base.Clone()
+          if ($mgr.Model)            { $mLbl.model = [string]$mgr.Model }
+          if ($mgr.FirmwareVersion) { $mLbl.firmware = [string]$mgr.FirmwareVersion }
+          if ($mgr.ManagerType)      { $mLbl.manager_type = [string]$mgr.ManagerType }
+
+          $lines.Add((PromLine "bmc_manager_info" $mLbl "1"))
+        } catch {}
+
+        try {
+          $therm = Invoke-IloJson -Ip $t.ip -Paths @(
+            "/redfish/v1/Chassis/1/Thermal/",
+            "/redfish/v1/Chassis/1/Thermal",
+            "/rest/v1/Chassis/1/Thermal/",
+            "/rest/v1/Chassis/1/Thermal"
+          ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+          if ($therm.Fans) {
+            foreach ($fan in $therm.Fans) {
+              $fanName = if ($fan.FanName) { [string]$fan.FanName } elseif ($fan.Name) { [string]$fan.Name } else { "fan" }
+
+              $fLbl = $base.Clone()
+              $fLbl.fan = $fanName
+
+              $fanOk = if ($fan.Status.Health -eq "OK") { 1 } else { 0 }
+              $lines.Add((PromLine "bmc_fan_health_ok" $fLbl ([string]$fanOk)))
+
+              if ($null -ne $fan.Reading) {
+                $lines.Add((PromLine "bmc_fan_rpm" $fLbl ([string]$fan.Reading)))
+              }
+            }
+          }
+
+          if ($therm.Temperatures) {
+            foreach ($temp in $therm.Temperatures) {
+              if ($null -ne $temp.ReadingCelsius) {
+                $sensorName = if ($temp.Name) { [string]$temp.Name } else { "temp" }
+
+                $tmpLbl = $base.Clone()
+                $tmpLbl.sensor = $sensorName
+
+                $lines.Add((PromLine "bmc_temp_celsius" $tmpLbl ([string]$temp.ReadingCelsius)))
+
+                $tempOk = if ($temp.Status.Health -eq "OK") { 1 } else { 0 }
+                $lines.Add((PromLine "bmc_temp_health_ok" $tmpLbl ([string]$tempOk)))
+              }
+            }
+          }
+        } catch {}
+
+        try {
+          $pwr = Invoke-IloJson -Ip $t.ip -Paths @(
+            "/redfish/v1/Chassis/1/Power/",
+            "/redfish/v1/Chassis/1/Power",
+            "/rest/v1/Chassis/1/Power/",
+            "/rest/v1/Chassis/1/Power"
+          ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+          if ($pwr.PowerSupplies) {
+            foreach ($psu in $pwr.PowerSupplies) {
+              $psuName = if ($psu.Name) { [string]$psu.Name } else { "psu" }
+
+              $pLbl = $base.Clone()
+              $pLbl.psu = $psuName
+
+              $psuOk = if ($psu.Status.Health -eq "OK") { 1 } else { 0 }
+              $lines.Add((PromLine "bmc_psu_health_ok" $pLbl ([string]$psuOk)))
+            }
+          }
+        } catch {}
+
+        try {
+          $ctrlRoot = Invoke-IloJson -Ip $t.ip -Paths @(
+            "/redfish/v1/Systems/1/SmartStorage/ArrayControllers/",
+            "/redfish/v1/Systems/1/SmartStorage/ArrayControllers",
+            "/rest/v1/Systems/1/SmartStorage/ArrayControllers/",
+            "/rest/v1/Systems/1/SmartStorage/ArrayControllers"
+          ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+          if ($ctrlRoot.Members) {
+            foreach ($ctrlMember in $ctrlRoot.Members) {
+              try {
+                $ctrlPath = $ctrlMember.'@odata.id'
+
+                $ctrl = Invoke-IloJson -Ip $t.ip -Paths @(
+                  $ctrlPath
+                ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+                $diskPath = $null
+
+                if ($ctrl.links.DiskDrives.'@odata.id') {
+                  $diskPath = $ctrl.links.DiskDrives.'@odata.id'
+                } elseif ($ctrl.Links.DiskDrives.'@odata.id') {
+                  $diskPath = $ctrl.Links.DiskDrives.'@odata.id'
+                }
+
+                if ($diskPath) {
+                  $drivesList = Invoke-IloJson -Ip $t.ip -Paths @(
+                    $diskPath
+                  ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+                  foreach ($dMember in $drivesList.Members) {
+                    try {
+                      $drv = Invoke-IloJson -Ip $t.ip -Paths @(
+                        $dMember.'@odata.id'
+                      ) -User $User -Pass $Pass -TimeoutSecLocal $TimeoutSec
+
+                      $driveId = if ($drv.Id) { [string]$drv.Id } else { "drive" }
+
+                      $dLbl = $base.Clone()
+                      $dLbl.drive = $driveId
+
+                      $healthOk = if ($drv.Status.Health -eq "OK") { 1 } else { 0 }
+                      $lines.Add((PromLine "bmc_drive_health_ok" $dLbl ([string]$healthOk)))
+
+                      $iLbl = $dLbl.Clone()
+                      if ($drv.Model)         { $iLbl.model = [string]$drv.Model }
+                      if ($drv.SerialNumber)  { $iLbl.serial = [string]$drv.SerialNumber }
+                      if ($drv.InterfaceType) { $iLbl.media_type = [string]$drv.InterfaceType }
+                      if ($drv.CapacityGB)    { $iLbl.capacity_gb = [string]$drv.CapacityGB }
+
+                      $lines.Add((PromLine "bmc_drive_info" $iLbl "1"))
+                    } catch {}
+                  }
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+
+      } catch {
+        $success = 0
+        $lines.Add((PromLine "bmc_up" $base "0"))
+
+        $errLbl = $base.Clone()
+        $errLbl.error = [string]$_.Exception.Message
+        $lines.Add((PromLine "bmc_scrape_error" $errLbl "1"))
+      }
+
+      $tDur = (New-TimeSpan -Start $tStart -End (Get-Date)).TotalSeconds
+      $lines.Add((PromLine "bmc_target_scrape_duration_seconds" $base ([string]([math]::Round($tDur, 3)))))
+      $lines.Add((PromLine "bmc_scrape_success" $base ([string]$success)))
+    }
+
+    $loopDur = (New-TimeSpan -Start $pollStart -End (Get-Date)).TotalSeconds
+    $lines.Add((PromLine "bmc_scrape_duration_seconds" @{} ([string]([math]::Round($loopDur, 3)))))
+    $lines.Add((PromLine "bmc_last_poll_timestamp" @{} ([string][int][DateTimeOffset]::Now.ToUnixTimeSeconds())))
+
+    $body = ($lines -join "`n") + "`n"
+    $body = $body -replace "`r", ""
+
+    try {
+      $tmp = "$MetricsPath.tmp"
+      [IO.File]::WriteAllText($tmp, $body, [Text.UTF8Encoding]::new($false))
+      Move-Item -Force $tmp $MetricsPath
+    } catch {}
+
+    Start-Sleep -Seconds $PollSeconds
+  }
+}
+
+$existing = Get-Job -Name "BMC_POLL" -ErrorAction SilentlyContinue
+if ($existing) {
+  Remove-Job -Name "BMC_POLL" -Force -ErrorAction SilentlyContinue
+}
+
+Start-Job -Name "BMC_POLL" -ScriptBlock $pollScript -ArgumentList $TargetsPath, $PollSeconds, $TimeoutSec, $MetricsPath, $BmcUser, $BmcPass | Out-Null
+
+$listener = New-Object System.Net.HttpListener
+$prefix = "http://+:$ListenPort/"
+$listener.Prefixes.Add($prefix)
+
+try {
+  $listener.Start()
+} catch {
+  throw "Impossibile avviare HttpListener su $prefix. Errore: $($_.Exception.Message)"
+}
+
+Write-Host "BMC Collector v5 iLO4 Ready: http://localhost:$ListenPort/metrics"
+
+while ($listener.IsListening) {
+  $ctx = $listener.GetContext()
+  $path = $ctx.Request.Url.AbsolutePath
+
+  if ($path -eq "/" -or $path -eq "/metrics") {
+    $body = "# no data yet`n"
+
+    if (Test-Path $MetricsPath) {
+      try {
+        $body = Get-Content $MetricsPath -Raw
+      } catch {
+        $body = "# read error`n"
+      }
+    }
+
+    $body = $body -replace "`r", ""
+    if (-not $body.EndsWith("`n")) { $body += "`n" }
+
+    $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+
+    $ctx.Response.StatusCode = 200
+    $ctx.Response.ContentType = "text/plain; version=0.0.4; charset=utf-8"
+    $ctx.Response.ContentLength64 = $bytes.Length
+    $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+    $ctx.Response.OutputStream.Close()
+  } else {
+    $ctx.Response.StatusCode = 404
+    $ctx.Response.OutputStream.Close()
+  }
+}
