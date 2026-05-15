@@ -1,0 +1,3 @@
+﻿[
+  { "name": "srv-hpe-01", "ip": "SERVERIP", "vendor": "hpe", "site": "CYBEROPS", "customer": "CYBEROPS" },
+]
